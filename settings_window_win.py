@@ -7,7 +7,16 @@ import os
 import sounddevice as sd
 
 BASE_DIR      = os.path.dirname(os.path.abspath(__file__))
-SETTINGS_FILE = os.path.join(BASE_DIR, "settings.json")
+def _ruta_settings():
+    """Misma ruta que usa voice_typer (importación diferida: evita el ciclo)."""
+    try:
+        from voice_typer import SETTINGS_FILE as ruta
+        return ruta
+    except Exception:
+        return os.path.join(BASE_DIR, "settings.json")
+
+
+SETTINGS_FILE = _ruta_settings()
 
 DEFAULT_SETTINGS = {
     "whisper_model":    "turbo",
@@ -26,6 +35,9 @@ DEFAULT_SETTINGS = {
     "memory_timeout":   0,
     "history_limit":    5,
     "history_retention": "keep_last",
+    "vad_enabled":      True,
+    "vad_threshold":    0.65,
+    "fuzzy_terms":      True,
 }
 
 def load_settings():

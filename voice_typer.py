@@ -34,10 +34,15 @@ def _dir_datos_usuario():
     problemas: puede invalidar la firma de código, se borra en cada
     reinstalación (el usuario pierde sus ajustes), y en algunos equipos
     /Applications no es escribible. Los datos del usuario van a
-    ~/Library/Application Support y solo lo de solo-lectura queda en el bundle.
+    la carpeta estándar de cada sistema (Application Support en macOS,
+    %APPDATA% en Windows) y solo lo de solo-lectura queda en el bundle.
     """
     if getattr(sys, "frozen", False):
-        d = os.path.expanduser("~/Library/Application Support/QStrauss Voice")
+        if IS_WINDOWS:
+            base = os.environ.get("APPDATA") or os.path.expanduser("~")
+            d = os.path.join(base, APP_NAME)
+        else:
+            d = os.path.expanduser("~/Library/Application Support/" + APP_NAME)
         try:
             os.makedirs(d, exist_ok=True)
             return d
