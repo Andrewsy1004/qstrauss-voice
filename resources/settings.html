@@ -449,11 +449,41 @@
     </div>
   </div>
 
+  <div class="section-title">DETECCI&Oacute;N DE VOZ</div>
+  <div class="card">
+    <div class="row">
+      <div class="row-left">Filtrar Silencio <span class="info-icon" title="Descarta el audio sin voz antes de transcribir. Sin esto, Whisper inventa frases sobre el silencio.">i</span></div>
+      <div class="row-right">
+        <div class="toggle on" id="vad-enabled" onclick="toggleSwitch(this, 'vad_enabled')"></div>
+      </div>
+    </div>
+    <div class="row">
+      <div class="row-left">Sensibilidad <span class="info-icon" title="Qu&eacute; tan seguro debe estar de que hay voz. Estricto descarta m&aacute;s; Permisivo transcribe m&aacute;s pero puede colar ruido.">i</span></div>
+      <div class="row-right">
+        <select id="vad-threshold" onchange="setSetting('vad_threshold', parseFloat(this.value))">
+          <option value="0.75">Estricto</option>
+          <option value="0.65" selected>Normal</option>
+          <option value="0.5">Permisivo</option>
+        </select>
+      </div>
+    </div>
+  </div>
+
   <div class="section-title">DICCIONARIO</div>
   <div class="card">
     <div class="row">
       <div class="row-left">Correcciones activas</div>
       <div class="row-right"><span id="dict-count" style="color:#3a4e72">&mdash;</span></div>
+    </div>
+    <div class="row">
+      <div class="row-left">Correcci&oacute;n Aproximada <span class="info-icon" title="Corrige t&eacute;rminos mal o&iacute;dos aunque no est&eacute;n listados, y une palabras partidas como work front. Requiere el diccionario del sistema en espa&ntilde;ol.">i</span></div>
+      <div class="row-right">
+        <div class="toggle on" id="fuzzy-terms" onclick="toggleSwitch(this, 'fuzzy_terms')"></div>
+      </div>
+    </div>
+    <div class="row">
+      <div class="row-left" style="color:#3a4e72; font-size:11px">Diccionario del sistema</div>
+      <div class="row-right"><span id="lexico-estado" style="color:#3a4e72; font-size:11px">&mdash;</span></div>
     </div>
     <div class="row">
       <div class="row-left">Recargar Diccionario <span class="info-icon" title="Recarga dictionary.json sin reiniciar">i</span></div>
@@ -709,6 +739,17 @@
   function loadSettings(cfg) {
     setToggle('push-to-talk', cfg.push_to_talk);
     setToggle('trailing-space', cfg.trailing_space !== false);
+    setToggle('vad-enabled', cfg.vad_enabled !== false);
+    setToggle('fuzzy-terms', cfg.fuzzy_terms !== false);
+    if (cfg.vad_threshold !== undefined) {
+      // El <select> compara strings: 0.5 debe quedar como "0.5", no "0.50".
+      document.getElementById('vad-threshold').value = String(cfg.vad_threshold);
+    }
+    if (cfg.lexico_ok !== undefined) {
+      var le = document.getElementById('lexico-estado');
+      le.textContent = cfg.lexico_ok ? 'disponible' : 'no disponible en este sistema';
+      le.style.color = cfg.lexico_ok ? '#00c896' : '#7a5a3a';
+    }
 
     if (cfg.language) document.getElementById('language').value = cfg.language;
     if (cfg.whisper_model) document.getElementById('whisper-model').value = cfg.whisper_model;

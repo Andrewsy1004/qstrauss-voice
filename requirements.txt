@@ -1,4 +1,8 @@
 faster-whisper>=1.0.0
+# onnxruntime es transitivo de faster-whisper, pero vad.py depende de él
+# directamente (Silero VAD). Se declara explícito para no romper si
+# faster-whisper cambia sus dependencias.
+onnxruntime>=1.16.0
 sounddevice>=0.4.6
 numpy>=1.24.0
 pyperclip>=1.8.2

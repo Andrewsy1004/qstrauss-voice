@@ -16,6 +16,17 @@ NSNonactivatingPanelMask = 1 << 7
 _NAVY  = (0.043, 0.067, 0.20, 0.94)   # #0b1133
 _TEAL  = (0.0,   0.784, 0.588, 1.0)   # #00c896
 _MUTED = (0.227, 0.306, 0.447, 0.6)   # #3a4e72 dim
+_DIM   = (0.55,  0.60,  0.70,  0.85)  # gris azulado, estado "sin voz"
+
+
+_LABELS = {
+    "listening":     "escuchando",
+    "transcribing":  "transcribiendo",
+    "no_speech":     "sin voz",
+    "portapapeles":  "copiado, pega con \u2318V",
+    "sin_permiso":   "falta permiso, pega con \u2318V",
+    "cargando":      "cargando el modelo, espera",
+}
 
 
 class _OverlayView(AppKit.NSView):
@@ -43,11 +54,13 @@ class _OverlayView(AppKit.NSView):
 
         if self._status == "listening":
             self._drawWave(w, h)
+        elif self._status in ("no_speech", "portapapeles", "sin_permiso", "cargando"):
+            self._drawFlatLine(w, h)
         else:
             self._drawTranscribingDots(w, h)
 
         # ── Small label bottom-right ────────────────────────────────────────
-        label = "escuchando" if self._status == "listening" else "transcribiendo"
+        label = _LABELS.get(self._status, "transcribiendo")
         attrs = {
             AppKit.NSFontAttributeName: AppKit.NSFont.systemFontOfSize_weight_(9.5, 0.3),
             AppKit.NSForegroundColorAttributeName: AppKit.NSColor.colorWithRed_green_blue_alpha_(*_MUTED),
@@ -91,6 +104,23 @@ class _OverlayView(AppKit.NSView):
             AppKit.NSBezierPath.bezierPathWithOvalInRect_(
                 NSMakeRect(cx - r, cy - r, r * 2, r * 2)
             ).fill()
+
+    @objc.python_method
+    def _drawFlatLine(self, w, h):
+        """Línea plana apagada: el VAD no encontró voz.
+
+        Es deliberadamente estática y sin color de marca. La onda teal animada
+        significa "te estoy oyendo"; su ausencia total, en el mismo lugar y con
+        la misma forma, se lee de inmediato como "no oí nada".
+        """
+        pad = h / 2 + 4
+        y = h / 2 + 3
+        path = AppKit.NSBezierPath.bezierPath()
+        path.setLineWidth_(2.0)
+        path.moveToPoint_((pad, y))
+        path.lineToPoint_((w - pad, y))
+        AppKit.NSColor.colorWithRed_green_blue_alpha_(*_DIM).setStroke()
+        path.stroke()
 
     @objc.python_method
     def setStatus(self, status):
