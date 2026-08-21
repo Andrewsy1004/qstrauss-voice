@@ -7,14 +7,16 @@ Mide dos tasas opuestas:
   falsos positivos  ruido que pasa como voz y terminaría alucinado por Whisper
   falsos negativos  habla real que se descarta y el usuario pierde
 
-Las frases cortas se generan con `say` de macOS. Si no está, esa parte se salta.
+El audio de habla son fixtures CONGELADOS en tests/fixtures/. Antes se
+generaban con `say` en cada corrida, y eso tenía dos problemas: la generación
+varía entre invocaciones, así que el test fallaba 1 de cada 4 veces sin que
+cambiara nada del código (un test intermitente enseña a ignorar los fallos); y
+`say` solo existe en macOS, así que en Windows la mitad del test se saltaba.
 """
 import glob
 import json
 import os
-import subprocess
 import sys
-import tempfile
 import wave
 
 import numpy as np
@@ -24,6 +26,7 @@ import vad
 SR = 16000
 BASE_DIR = os.path.dirname(os.path.abspath(__file__))
 FRASES_CORTAS = ["si", "no", "ok", "dale", "listo", "gracias"]
+FIXTURES = os.path.join(BASE_DIR, "tests", "fixtures")
 
 
 def cargar_settings():
@@ -72,19 +75,6 @@ def muestras_no_habla():
     return out
 
 
-def _say(texto, destino):
-    aiff = destino + ".aiff"
-    try:
-        subprocess.run(["say", "-o", aiff, texto], check=True,
-                       stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
-        subprocess.run(["afconvert", "-f", "WAVE", "-d", "LEI16@16000", "-c", "1",
-                        aiff, destino], check=True,
-                       stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
-        return True
-    except Exception:
-        return False
-
-
 def _leer_wav(path):
     w = wave.open(path)
     try:
@@ -94,12 +84,12 @@ def _leer_wav(path):
     return np.frombuffer(raw, dtype=np.int16).astype(np.float32) / 32768.0
 
 
-def muestras_habla(tmpdir):
-    """Habla real a varias amplitudes, con y sin silencio alrededor."""
-    largo = os.path.join(tmpdir, "largo.wav")
-    if not _say("Hola, esto es una prueba de dictado con Workfront y Microsoft Teams.", largo):
+def muestras_habla():
+    """Habla real desde fixtures congelados. Mismo corpus en cada corrida."""
+    larga = os.path.join(FIXTURES, "larga.wav")
+    if not os.path.exists(larga):
         return [], []
-    sp = _leer_wav(largo)
+    sp = _leer_wav(larga)
 
     normales = [("habla x%.2f" % k, (sp * k).astype(np.float32))
                 for k in (1.0, 0.5, 0.3, 0.15, 0.05, 0.02, 0.01)]
@@ -112,8 +102,8 @@ def muestras_habla(tmpdir):
     cortas = []
     pad = np.zeros(SR, dtype=np.float32)
     for frase in FRASES_CORTAS:
-        p = os.path.join(tmpdir, "c_%s.wav" % frase)
-        if _say(frase, p):
+        p = os.path.join(FIXTURES, "%s.wav" % frase)
+        if os.path.exists(p):
             a = _leer_wav(p)
             cortas.append(('"%s" (%.2fs)' % (frase, len(a) / float(SR)),
                            np.concatenate([pad, a, pad]).astype(np.float32)))
@@ -142,10 +132,9 @@ def main():
         print("     FALLA: demasiados falsos positivos")
         fallos += 1
 
-    tmpdir = tempfile.mkdtemp(prefix="vadtest_")
-    normales, cortas = muestras_habla(tmpdir)
+    normales, cortas = muestras_habla()
     if not normales:
-        print("\nSIN `say` disponible, se salta la parte de habla")
+        print("\nFaltan los fixtures en tests/fixtures/, se salta la parte de habla")
     else:
         fn = [n for n, a in normales if not decide(a, settings)[0]]
         print("HABLA      %3d muestras  ->  %d falsos negativos" % (len(normales), len(fn)))
