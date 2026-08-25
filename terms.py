@@ -41,6 +41,8 @@ degradación segura, porque el modo de falla de esta función es corromper texto
 correcto, y eso es peor que no corregir nada.
 """
 
+import io
+import os
 import re
 import unicodedata
 
@@ -99,14 +101,71 @@ def levenshtein(a, b):
 
 # ─── Léxico ──────────────────────────────────────────────────────────────────
 
-class Lexico(object):
-    """Envuelve NSSpellChecker. `disponible` es False fuera de macOS."""
+# Nombre del archivo opcional de palabras. Si existe junto a este módulo, se
+# usa en vez del corrector del sistema, y con eso Windows obtiene la misma
+# corrección difusa que macOS.
+WORDLIST_NOMBRE = "es_words.txt"
 
-    def __init__(self, idioma="es"):
+
+def _wordlist_por_defecto():
+    aqui = os.path.dirname(os.path.abspath(__file__))
+    return os.path.join(aqui, WORDLIST_NOMBRE)
+
+
+def _cargar_wordlist(ruta):
+    """Lee el archivo a un set indexado SIN tildes.
+
+    Guardar la forma sin diacríticos resuelve gratis el caso que en macOS
+    necesita pedir sugerencias: si Whisper se come una tilde, "asi" sigue
+    encontrando a "así" y no se convierte en un término desconocido.
+    """
+    palabras = set()
+    with io.open(ruta, encoding="utf-8") as f:
+        for linea in f:
+            w = linea.strip()
+            if not w or w.startswith("#"):
+                continue
+            k = sin_tildes(w)
+            if k:
+                palabras.add(k)
+    return palabras
+
+
+class Lexico(object):
+    """Decide si una palabra existe en español. Dos backends intercambiables.
+
+    1. NSSpellChecker, el corrector del sistema. Solo macOS, sin archivos que
+       distribuir y con detección de deslices de tilde vía sugerencias.
+    2. Un archivo de palabras (una por línea), que funciona en cualquier
+       plataforma. Es la vía para Windows, donde el backend 1 no existe.
+
+    Sin ninguno de los dos, `disponible` queda en False y quien llame debe
+    saltarse la corrección difusa por completo. Esa es la degradación segura:
+    el modo de falla de esta función es corromper texto correcto.
+    """
+
+    def __init__(self, idioma="es", wordlist=None):
         self.idioma = idioma
         self.disponible = False
+        self.backend = None
         self._cache = {}
         self._checker = None
+        self._palabras = None
+
+        # El archivo tiene prioridad: si alguien lo puso, es a propósito, y
+        # además hace que las dos plataformas se comporten igual.
+        ruta = wordlist or _wordlist_por_defecto()
+        if ruta and os.path.exists(ruta):
+            try:
+                self._palabras = _cargar_wordlist(ruta)
+                if self._palabras:
+                    self.disponible = True
+                    self.backend = "wordlist:%s (%d palabras)" % (
+                        os.path.basename(ruta), len(self._palabras))
+                    return
+            except Exception:
+                self._palabras = None
+
         try:
             from AppKit import NSSpellChecker
             from Foundation import NSMakeRange
@@ -114,6 +173,7 @@ class Lexico(object):
             self._rango = NSMakeRange
             if idioma in list(self._checker.availableLanguages() or []):
                 self.disponible = True
+                self.backend = "NSSpellChecker"
         except Exception:
             self.disponible = False
 
@@ -147,6 +207,10 @@ class Lexico(object):
         key = palabra.lower()
         if key in self._cache:
             return self._cache[key]
+        if self._palabras is not None:
+            ok = sin_tildes(palabra) in self._palabras
+            self._cache[key] = ok
+            return ok
         try:
             ok = self._bien_escrita(palabra) or self._es_desliz_de_tilde(palabra)
         except Exception:
