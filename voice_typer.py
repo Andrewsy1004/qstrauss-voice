@@ -414,6 +414,17 @@ def _stop_and_transcribe(update_ui=None):
             update_ui("idle")
         return
 
+    # Algunos micrófonos, con ganancia alta o conversión de frecuencia de por
+    # medio, entregan float32 fuera del rango [-1, 1]. No es pérdida de
+    # información (float32 lo representa bien), pero a ganancias extremas
+    # degrada la detección de voz. Medido sobre la misma frase: a x8 el VAD
+    # recupera 4.30s en vez de 5.83s; normalizando vuelve a 5.80s. A x2 y x4
+    # no cambia nada, así que normalizar es gratis.
+    if peak > 1.0:
+        log("Audio por encima de rango (pico %.2f), normalizando" % peak)
+        audio = (audio / peak).astype(np.float32)
+        peak = 1.0
+
     # ── VAD: quitar el silencio ANTES de que Whisper lo alucine ──────────────
     # Se aplica aquí, fuera del modelo, para que MLX y faster-whisper reciban
     # exactamente el mismo audio. mlx_whisper.transcribe() no acepta vad_filter.
