@@ -72,6 +72,12 @@ def main():
         return 0
 
     correcciones, lista = cargar_terminos()
+    print("backend léxico: %s" % lex.backend)
+    if lex.backend != "hunspell RLA-ES":
+        # El diccionario empaquetado es lo que hace que Windows se comporte
+        # igual que macOS. Si falta, esta corrida NO prueba lo que cree probar.
+        print("   AVISO: no se está usando el diccionario de resources/dic/,")
+        print("   así que estos resultados no representan a Windows.")
     print("%d términos, %d correcciones exactas\n" % (len(lista), len(correcciones)))
 
     def pipeline(t):

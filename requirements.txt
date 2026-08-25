@@ -3,6 +3,11 @@ faster-whisper>=1.0.0
 # directamente (Silero VAD). Se declara explícito para no romper si
 # faster-whisper cambia sus dependencias.
 onnxruntime>=1.16.0
+
+# Lectura del diccionario hunspell (resources/dic/) para el guard lexico de
+# terms.py. Es puro Python, asi que empaqueta sin problemas y da el mismo
+# comportamiento en macOS y en Windows.
+spylls>=0.1.7
 sounddevice>=0.4.6
 numpy>=1.24.0
 pyperclip>=1.8.2

@@ -39,6 +39,7 @@ pyinstaller \
   --hidden-import "mlx.nn" \
   --hidden-import "vad" \
   --hidden-import "terms" \
+  --hidden-import "spylls" \
   --hidden-import "onnxruntime" \
   --hidden-import "faster_whisper" \
   --hidden-import "ctranslate2" \
@@ -58,6 +59,7 @@ pyinstaller \
   --collect-all "mlx" \
   --collect-binaries "mlx" \
   --collect-data "mlx" \
+  --collect-all "spylls" \
   --collect-all "onnxruntime" \
   --collect-all "faster_whisper" \
   --collect-all "ctranslate2" \
