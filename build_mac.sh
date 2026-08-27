@@ -31,6 +31,16 @@ pyinstaller \
   --add-data "resources:resources" \
   --add-data "overlay.py:." \
   --add-data "settings_window.py:." \
+  --add-data "vad.py:." \
+  --add-data "terms.py:." \
+  --hidden-import "mlx_whisper" \
+  --hidden-import "mlx" \
+  --hidden-import "mlx.core" \
+  --hidden-import "mlx.nn" \
+  --hidden-import "vad" \
+  --hidden-import "terms" \
+  --hidden-import "spylls" \
+  --hidden-import "onnxruntime" \
   --hidden-import "faster_whisper" \
   --hidden-import "ctranslate2" \
   --hidden-import "tokenizers" \
@@ -45,6 +55,12 @@ pyinstaller \
   --hidden-import "WebKit" \
   --hidden-import "overlay" \
   --hidden-import "settings_window" \
+  --collect-all "mlx_whisper" \
+  --collect-all "mlx" \
+  --collect-binaries "mlx" \
+  --collect-data "mlx" \
+  --collect-all "spylls" \
+  --collect-all "onnxruntime" \
   --collect-all "faster_whisper" \
   --collect-all "ctranslate2" \
   --collect-all "pyobjc-framework-Cocoa" \

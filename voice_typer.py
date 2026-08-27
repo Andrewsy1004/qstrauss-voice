@@ -17,15 +17,78 @@ import sounddevice as sd
 import pyperclip
 from faster_whisper import WhisperModel
 
+import vad
+import terms
+
 IS_MAC     = sys.platform == "darwin"
 IS_WINDOWS = sys.platform == "win32"
 
 APP_NAME        = "QStrauss Voice"
 BASE_DIR        = os.path.dirname(os.path.abspath(__file__))
-DICTIONARY_FILE = os.path.join(BASE_DIR, "dictionary.json")
+
+
+def _dir_datos_usuario():
+    """Dónde guardar lo que el usuario modifica.
+
+    Empaquetada, BASE_DIR apunta DENTRO del .app. Escribir ahí tiene tres
+    problemas: puede invalidar la firma de código, se borra en cada
+    reinstalación (el usuario pierde sus ajustes), y en algunos equipos
+    /Applications no es escribible. Los datos del usuario van a
+    la carpeta estándar de cada sistema (Application Support en macOS,
+    %APPDATA% en Windows) y solo lo de solo-lectura queda en el bundle.
+    """
+    if getattr(sys, "frozen", False):
+        if IS_WINDOWS:
+            base = os.environ.get("APPDATA") or os.path.expanduser("~")
+            d = os.path.join(base, APP_NAME)
+        else:
+            d = os.path.expanduser("~/Library/Application Support/" + APP_NAME)
+        try:
+            os.makedirs(d, exist_ok=True)
+            return d
+        except Exception:
+            return BASE_DIR
+    return BASE_DIR
+
+
+DATA_DIR = _dir_datos_usuario()
+
+
+def _archivo_de_usuario(nombre):
+    """Ruta en DATA_DIR, sembrada desde el bundle la primera vez.
+
+    Así el diccionario queda editable por el usuario en vez de enterrado
+    dentro del paquete, y sobrevive a las reinstalaciones.
+    """
+    destino = os.path.join(DATA_DIR, nombre)
+    origen = os.path.join(BASE_DIR, nombre)
+    if not os.path.exists(destino) and os.path.exists(origen) and destino != origen:
+        try:
+            import shutil
+            shutil.copy2(origen, destino)
+        except Exception:
+            return origen
+    return destino
+
+
+DICTIONARY_FILE = _archivo_de_usuario("dictionary.json")
 RESOURCES_DIR   = os.path.join(BASE_DIR, "resources")
-SETTINGS_FILE   = os.path.join(BASE_DIR, "settings.json")
+SETTINGS_FILE   = os.path.join(DATA_DIR, "settings.json")
 SAMPLE_RATE     = 16000
+# Tamaño de bloque del stream de audio, en muestras.
+#
+# Sin esto sounddevice pasa blocksize=0 y deja que el driver elija. CoreAudio
+# eligió 15 frames (0.94 ms), lo que dispara el callback de Python MÁS DE MIL
+# VECES POR SEGUNDO, cada una tomando el GIL desde un hilo de audio en tiempo
+# real, y de forma permanente porque el stream nunca se cierra. Medido: 8363
+# callbacks en 7.8 s de grabación.
+#
+# 1600 muestras son 100 ms: 10 callbacks por segundo en vez de 1072, unas 100
+# veces menos trabajo. No afecta la latencia percibida porque la grabación se
+# corta al pulsar el atajo, no por bloque, y el VAD ya recorta los bordes.
+BLOCK_SIZE      = 1600
+# Cuánto se queda el aviso "sin voz" en pantalla antes de cerrarse solo.
+NO_SPEECH_FLASH_S = 1.4
 
 # ─── Settings ────────────────────────────────────────────────────────────────
 
@@ -38,6 +101,12 @@ DEFAULT_SETTINGS = {
     "hotkey_display": "⌥ Space" if IS_MAC else "Ctrl + Space",
     "trailing_space": True,
     "paste_mode": "clipboard_paste",
+    "vad_enabled": True,
+    "vad_threshold": 0.65,
+    "vad_min_speech_ms": 200,
+    "vad_speech_pad_ms": 200,
+    "vad_min_silence_ms": 300,
+    "fuzzy_terms": True,
 }
 
 def load_settings():
@@ -60,6 +129,16 @@ state = {
     "audio_chunks":   [],
     "corrections":    {},
     "initial_prompt": "",
+    "term_list":      [],
+    "lexico":         None,
+    "transcribing":   False,
+    # Contador de generación. Cancelar lo incrementa; la transcripción en
+    # vuelo compara contra el valor que capturó al empezar y se descarta si
+    # cambió. Evita la carrera de cancelar mientras el modelo ya corre.
+    "gen":            0,
+    "model_error":    None,
+    "ultimo_uso":     0.0,
+    "descargado":     False,
     "model":          None,
     "backend":        "faster_whisper",  # "mlx" on Apple Silicon, "faster_whisper" on Windows
 }
@@ -69,18 +148,27 @@ lock = threading.Lock()
 
 def load_dictionary():
     if not os.path.exists(DICTIONARY_FILE):
-        return {}, ""
+        return {}, "", []
     with open(DICTIONARY_FILE, "r", encoding="utf-8") as f:
         data = json.load(f)
     corrections    = {k.lower(): v for k, v in data.get("corrections", {}).items()}
-    initial_prompt = ", ".join(data.get("hints", []))
-    return corrections, initial_prompt
+    hints          = data.get("hints", [])
+    initial_prompt = ", ".join(hints)
+    # Los hints son a la vez el sesgo del decoder y el corpus contra el que se
+    # comparan los términos mal oídos. Se agregan los destinos de las
+    # correcciones exactas para no tener que repetirlos en las dos listas.
+    term_list      = list(dict.fromkeys(hints + list(corrections.values())))
+    return corrections, initial_prompt, term_list
 
 def reload_dictionary():
-    c, p = load_dictionary()
+    c, p, t = load_dictionary()
     state["corrections"]    = c
     state["initial_prompt"] = p
-    print(f"Dictionary: {len(c)} corrections loaded")
+    state["term_list"]      = t
+    if state["lexico"] is None:
+        state["lexico"] = terms.Lexico()
+    print(f"Dictionary: {len(c)} corrections, {len(t)} terms, "
+          f"lexico={'si' if state['lexico'].disponible else 'no'}")
 
 # ─── Sound effects ───────────────────────────────────────────────────────────
 
@@ -97,15 +185,22 @@ audio_stream = None
 
 _audio_cb_count = 0
 
+_audio_cb_status = [None]
+
 def audio_callback(indata, frames, time_info, status):
+    """Callback de audio en tiempo real. Debe ser lo más barato posible.
+
+    Nada de I/O de disco aquí: `log()` abre y cierra el archivo en cada
+    llamada, y hacer eso desde un hilo de audio de tiempo real bloquea la
+    entrega de buffers. El estado se guarda en una variable y lo registra
+    quien pare la grabación.
+    """
     global _audio_cb_count
     _audio_cb_count += 1
     if status:
-        log(f"[audio_cb] status: {status}")
+        _audio_cb_status[0] = str(status)
     if state["recording"]:
         state["audio_chunks"].append(indata.copy())
-        if len(state["audio_chunks"]) % 50 == 1:
-            log(f"[audio_cb] chunk #{len(state['audio_chunks'])}, frames={frames}")
 
 def start_audio_stream():
     global audio_stream
@@ -119,6 +214,7 @@ def start_audio_stream():
             dtype="float32",
             callback=audio_callback,
             device=device,
+            blocksize=BLOCK_SIZE,
         )
         audio_stream.start()
         log(f"Audio stream ready: active={audio_stream.active}")
@@ -131,6 +227,7 @@ def start_audio_stream():
                 channels=1,
                 dtype="float32",
                 callback=audio_callback,
+                blocksize=BLOCK_SIZE,
             )
             audio_stream.start()
             log(f"Audio stream ready (default fallback): active={audio_stream.active}")
@@ -143,13 +240,122 @@ def current_language():
     lang = settings.get("language", "auto")
     return None if lang == "auto" else lang
 
+# ─── Foco y pegado ───────────────────────────────────────────────────────────
+#
+# La app pega con un Cmd+V sintético, así que el texto cae en lo que tenga el
+# foco EN ESE MOMENTO, no en lo que lo tenía cuando empezaste a hablar. Basta
+# con que la ventana de ajustes esté al frente para que el dictado aterrice
+# ahí. Por eso se guarda la app de destino al empezar a grabar y se le devuelve
+# el foco justo antes de pegar.
+
+_foco = {"app": None}
+
+def _recordar_foco():
+    """Guarda qué aplicación tenía el foco al empezar a grabar."""
+    if not IS_MAC:
+        return
+    try:
+        import AppKit
+        app = AppKit.NSWorkspace.sharedWorkspace().frontmostApplication()
+        # Si el frente es esta misma app (ventana de ajustes), no hay destino
+        # externo que restaurar: pegar ahí sería el bug que queremos evitar.
+        if app is None or app.processIdentifier() == os.getpid():
+            _foco["app"] = None
+            log("Foco: la app propia está al frente, no hay destino externo")
+        else:
+            _foco["app"] = app
+            log("Foco guardado: %s" % app.localizedName())
+    except Exception as e:
+        _foco["app"] = None
+        log("No se pudo guardar el foco: %s" % e)
+
+def _restaurar_foco():
+    """Devuelve el foco a la app que lo tenía al empezar a grabar."""
+    if not IS_MAC:
+        return True
+    app = _foco.get("app")
+    if app is None:
+        return False
+    try:
+        import AppKit
+        actual = AppKit.NSWorkspace.sharedWorkspace().frontmostApplication()
+        if actual is not None and actual.processIdentifier() == app.processIdentifier():
+            return True   # ya está al frente, no hace falta nada
+        NSApplicationActivateIgnoringOtherApps = 1 << 1
+        app.activateWithOptions_(NSApplicationActivateIgnoringOtherApps)
+        time.sleep(0.12)  # darle tiempo a venir al frente antes del Cmd+V
+        log("Foco devuelto a %s" % app.localizedName())
+        return True
+    except Exception as e:
+        log("No se pudo devolver el foco: %s" % e)
+        return False
+
+def accesibilidad_ok(pedir=False):
+    """True si el proceso puede sintetizar teclas (permiso de Accesibilidad).
+
+    Es un chequeo obligatorio, no un lujo: `CGEventPost` NO falla ni lanza
+    excepción cuando falta el permiso, simplemente descarta el evento. Sin
+    esta comprobación la app registra "pegado enviado" y no pega nada, que es
+    la peor forma de fallar: silenciosa y con el log mintiendo.
+    """
+    if not IS_MAC:
+        return True
+    try:
+        import ApplicationServices as AS
+        if pedir:
+            return bool(AS.AXIsProcessTrustedWithOptions(
+                {AS.kAXTrustedCheckOptionPrompt: True}))
+        return bool(AS.AXIsProcessTrusted())
+    except Exception as e:
+        log("No se pudo consultar Accesibilidad: %s" % e)
+        return True   # ante la duda, intentar pegar
+
+def _pegar_en_cursor():
+    """Envía Cmd+V (o Ctrl+V) al destino que tenga el foco.
+
+    En macOS usa CGEventPost en vez de osascript: el AppleScript levanta un
+    intérprete entero por cada pegado (~270 ms medidos) y agrega un subproceso
+    que puede fallar por timeout. El evento nativo es inmediato. Ambos caminos
+    necesitan el mismo permiso de Accesibilidad.
+    """
+    if IS_MAC:
+        import Quartz
+        kVK_ANSI_V = 9
+        src = Quartz.CGEventSourceCreate(Quartz.kCGEventSourceStateHIDSystemState)
+        for abajo in (True, False):
+            ev = Quartz.CGEventCreateKeyboardEvent(src, kVK_ANSI_V, abajo)
+            Quartz.CGEventSetFlags(ev, Quartz.kCGEventFlagMaskCommand)
+            Quartz.CGEventPost(Quartz.kCGHIDEventTap, ev)
+    else:
+        from pynput import keyboard as kb
+        ctrl = kb.Controller()
+        with ctrl.pressed(kb.Key.ctrl):
+            ctrl.press('v')
+            ctrl.release('v')
+
 # ─── Recording ───────────────────────────────────────────────────────────────
 
 def start_recording(update_ui=None):
     global _audio_cb_count
     log(f"start_recording called (audio_cb_count={_audio_cb_count}, stream_active={audio_stream.active if audio_stream else 'None'})")
+    if state["model"] is None and state.get("descargado"):
+        log("Modelo descargado por inactividad, recargando")
+        state["descargado"] = False
+        threading.Thread(target=load_model, daemon=True).start()
+        if update_ui:
+            update_ui("cargando")
+        return
+
     if state["model"] is None:
-        log("Model not ready yet")
+        err = state.get("model_error")
+        if err:
+            log("No se puede grabar: el modelo falló al cargar (%s)" % err)
+        else:
+            log("El modelo todavía se está cargando, espera unos segundos")
+        # Pulsar el atajo y que no pase absolutamente nada es indistinguible de
+        # que la app esté colgada. El overlay lo dice.
+        if update_ui:
+            update_ui("cargando")
         return
     with lock:
         if state["recording"]:
@@ -157,20 +363,44 @@ def start_recording(update_ui=None):
         state["recording"]    = True
         state["audio_chunks"] = []
     _audio_cb_count = 0
+    _recordar_foco()
+    _register_escape()
     play_sfx(SFX_START)
     log("Recording started — speak now")
     if update_ui:
         update_ui("recording")
 
 def stop_and_transcribe(update_ui=None):
+    """Envoltorio: garantiza que el estado quede limpio por cualquier salida.
+
+    El cuerpo tiene varias salidas tempranas (sin audio, silencio, error del
+    modelo, cancelación). Sin el finally, cualquiera de ellas dejaría
+    `transcribing` en True y Escape registrado para siempre.
+    """
+    try:
+        _stop_and_transcribe(update_ui=update_ui)
+    finally:
+        with lock:
+            state["transcribing"] = False
+        _unregister_escape()
+
+
+def _stop_and_transcribe(update_ui=None):
     with lock:
         if not state["recording"]:
             return
         state["recording"] = False
+        state["transcribing"] = True
+        mi_gen = state["gen"]
         chunks = list(state["audio_chunks"])
         state["audio_chunks"] = []
+    # Escape sigue vivo durante la transcripción: es cuando el usuario se da
+    # cuenta de que dijo algo mal. Se libera en el finally del envoltorio.
 
     log(f"stop_and_transcribe: {len(chunks)} chunks, audio_cb_count={_audio_cb_count}")
+    if _audio_cb_status[0]:
+        log("Avisos del stream de audio durante la grabación: %s" % _audio_cb_status[0])
+        _audio_cb_status[0] = None
     play_sfx(SFX_STOP)
 
     if update_ui:
@@ -194,6 +424,40 @@ def stop_and_transcribe(update_ui=None):
             update_ui("idle")
         return
 
+    # Algunos micrófonos, con ganancia alta o conversión de frecuencia de por
+    # medio, entregan float32 fuera del rango [-1, 1]. No es pérdida de
+    # información (float32 lo representa bien), pero a ganancias extremas
+    # degrada la detección de voz. Medido sobre la misma frase: a x8 el VAD
+    # recupera 4.30s en vez de 5.83s; normalizando vuelve a 5.80s. A x2 y x4
+    # no cambia nada, así que normalizar es gratis.
+    if peak > 1.0:
+        log("Audio por encima de rango (pico %.2f), normalizando" % peak)
+        audio = (audio / peak).astype(np.float32)
+        peak = 1.0
+
+    # ── VAD: quitar el silencio ANTES de que Whisper lo alucine ──────────────
+    # Se aplica aquí, fuera del modelo, para que MLX y faster-whisper reciban
+    # exactamente el mismo audio. mlx_whisper.transcribe() no acepta vad_filter.
+    if settings.get("vad_enabled", True) and vad.is_available():
+        speech, vstats = vad.analyze(audio, settings, SAMPLE_RATE)
+        if not vstats["ok"]:
+            log("VAD omitido: %s" % vstats["reason"])
+        else:
+            log("VAD: %d segmento(s), %.2fs de voz en %.2fs (%.0f%%)" % (
+                vstats["segments"], vstats["speech_s"],
+                vstats["original_s"], vstats["ratio"] * 100))
+            chosen, why = vad.decide(
+                speech, vstats, audio, peak, rms, settings, SAMPLE_RATE)
+            if chosen is None:
+                # Abortar en silencio deja al usuario sin saber qué pasó, así
+                # que el overlay lo dice antes de cerrarse.
+                log("No se transcribe: %s" % why)
+                if update_ui:
+                    update_ui("no_speech")
+                return
+            audio = np.asarray(chosen, dtype=np.float32).flatten()
+            log("Audio a transcribir: %.2fs [%s]" % (len(audio) / SAMPLE_RATE, why))
+
     t0 = time.time()
     try:
         if state.get("backend") == "mlx":
@@ -215,8 +479,7 @@ def stop_and_transcribe(update_ui=None):
                 language=current_language(),
                 beam_size=1,
                 temperature=0,
-                vad_filter=True,
-                vad_parameters={"min_silence_duration_ms": 300, "speech_pad_ms": 200},
+                vad_filter=False,  # ya se filtró arriba con vad.analyze()
                 condition_on_previous_text=False,
                 no_speech_threshold=0.6,
                 initial_prompt=state["initial_prompt"] or None,
@@ -236,34 +499,78 @@ def stop_and_transcribe(update_ui=None):
         log("No speech detected")
         return
 
-    for wrong, correct in state["corrections"].items():
-        if wrong in text.lower():
-            text = re.sub(re.escape(wrong), correct, text, flags=re.IGNORECASE)
+    # Dos capas complementarias. Las exactas van primero y siempre ganan:
+    # atrapan errores FONÉTICOS que la distancia de edición no alcanza
+    # ("eicher" -> "Azure" son 5 ediciones sobre 6 letras). Las difusas
+    # atrapan errores ORTOGRÁFICOS y palabras partidas ("work front").
+    text = terms.aplicar_exactas(text, state["corrections"])
+    if settings.get("fuzzy_terms", True):
+        text, cambios = terms.aplicar_difusas(
+            text, state["term_list"], state["lexico"])
+        if cambios:
+            log("Términos corregidos: %s" % "; ".join(cambios))
 
     if settings.get("trailing_space", True):
         text += " "
 
+    state["ultimo_uso"] = time.time()
     log(f"Transcribed: {text.strip()}")
 
-    pyperclip.copy(text)
-    time.sleep(0.08)
+    with lock:
+        if mi_gen != state["gen"]:
+            log("Transcripción descartada: se canceló mientras corría el modelo")
+            return
 
-    if IS_MAC:
-        try:
-            subprocess.run(
-                ["osascript", "-e",
-                 'tell application "System Events" to keystroke "v" using command down'],
-                timeout=3,
-            )
-            log("Paste command sent")
-        except Exception as e:
-            log(f"Paste error: {e}")
-    else:
-        from pynput import keyboard as kb
-        ctrl = kb.Controller()
-        with ctrl.pressed(kb.Key.ctrl):
-            ctrl.press('v')
-            ctrl.release('v')
+    pyperclip.copy(text)
+
+    if settings.get("paste_mode") == "clipboard_only":
+        log("Modo 'solo portapapeles': no se pega automáticamente")
+        if update_ui:
+            update_ui("portapapeles")
+        return
+
+    hay_destino = _restaurar_foco()
+    if not hay_destino and IS_MAC:
+        # Nadie externo tenía el foco al empezar (típicamente la ventana de
+        # ajustes estaba al frente). Pegar aquí metería el dictado en la propia
+        # app, así que se deja en el portapapeles y se avisa.
+        log("Sin destino externo: el texto quedó en el portapapeles, pega con Cmd+V")
+        if update_ui:
+            update_ui("portapapeles")
+        return
+
+    if not accesibilidad_ok():
+        log("SIN PERMISO DE ACCESIBILIDAD: no se puede pegar automáticamente. "
+            "El texto quedó en el portapapeles. Concede el permiso en "
+            "Ajustes del Sistema > Privacidad y seguridad > Accesibilidad.")
+        if update_ui:
+            update_ui("sin_permiso")
+        return
+
+    time.sleep(0.08)
+    try:
+        _pegar_en_cursor()
+        log("Pegado enviado")
+    except Exception as e:
+        log("Error al pegar: %s (el texto está en el portapapeles)" % e)
+
+def cancel_recording(update_ui=None):
+    """Descarta la grabación en curso sin transcribir ni pegar nada."""
+    with lock:
+        if not (state["recording"] or state["transcribing"]):
+            return False
+        grabando = state["recording"]
+        state["recording"] = False
+        n = len(state["audio_chunks"])
+        state["audio_chunks"] = []
+        state["gen"] += 1          # invalida cualquier transcripción en vuelo
+    _unregister_escape()
+    play_sfx(SFX_STOP)
+    log("Cancelado durante %s (%d chunks descartados)" % (
+        "la grabación" if grabando else "la transcripción", n))
+    if update_ui:
+        update_ui("idle")
+    return True
 
 def toggle_recording(update_ui=None):
     log(f"toggle_recording: recording={state['recording']}")
@@ -273,6 +580,30 @@ def toggle_recording(update_ui=None):
         ).start()
     else:
         start_recording(update_ui=update_ui)
+
+# ─── Cancelar con Escape ─────────────────────────────────────────────────────
+#
+# Escape NO se registra de forma permanente: eso le robaría la tecla a todas
+# las apps del sistema. Se registra al empezar a grabar y se libera al parar,
+# así solo existe durante los segundos en que tiene sentido.
+
+_escape_state = {"registrar": None, "liberar": None}
+
+def _register_escape():
+    fn = _escape_state["registrar"]
+    if fn:
+        try:
+            fn()
+        except Exception as e:
+            log("No se pudo registrar Escape: %s" % e)
+
+def _unregister_escape():
+    fn = _escape_state["liberar"]
+    if fn:
+        try:
+            fn()
+        except Exception as e:
+            log("No se pudo liberar Escape: %s" % e)
 
 # ─── Hotkey listener ─────────────────────────────────────────────────────────
 
@@ -326,25 +657,77 @@ def _start_hotkey_mac(update_ui=None):
         c_uint32, c_uint32, EventHotKeyID, c_void_p, c_uint32, POINTER(c_void_p),
     ]
     carbon.RegisterEventHotKey.restype = c_int32
+    carbon.UnregisterEventHotKey.argtypes = [c_void_p]
+    carbon.UnregisterEventHotKey.restype = c_int32
+    # GetEventParameter permite saber CUÁL hotkey disparó. Sin esto, el
+    # handler es único y no distingue el atajo principal de Escape.
+    carbon.GetEventParameter.argtypes = [
+        c_void_p, c_uint32, c_uint32, c_void_p, c_uint32, c_void_p, c_void_p,
+    ]
+    carbon.GetEventParameter.restype = c_int32
+    carbon.GetEventKind.argtypes = [c_void_p]
+    carbon.GetEventKind.restype = c_uint32
 
     EventHandlerProc = CFUNCTYPE(c_int32, c_void_p, c_void_p, c_void_p)
 
+    kEventHotKeyReleased = 6
+    kEventParamDirectObject = 0x6F626A20   # 'obj '
+    typeEventHotKeyID       = 0x686B6964   # 'hkid'
+    ID_TOGGLE, ID_CANCEL = 1, 2
+
+    def _quien_disparo(event):
+        hk = EventHotKeyID()
+        err = carbon.GetEventParameter(
+            event, c_uint32(kEventParamDirectObject), c_uint32(typeEventHotKeyID),
+            None, c_uint32(ctypes.sizeof(hk)), None, byref(hk),
+        )
+        return hk.id if err == 0 else ID_TOGGLE
+
     def _on_hotkey(next_handler, event, user_data):
-        log(">>> HOTKEY PRESSED <<<")
-        toggle_recording(update_ui=update_ui)
+        cual = _quien_disparo(event)
+        soltada = carbon.GetEventKind(event) == kEventHotKeyReleased
+
+        if cual == ID_CANCEL:
+            if not soltada:
+                log(">>> ESCAPE <<<")
+                cancel_recording(update_ui=update_ui)
+            return 0
+
+        # Mantener presionado: pulsar graba, soltar transcribe. Sin esto, el
+        # atajo alterna y hay que pulsarlo dos veces.
+        if settings.get("push_to_talk", False):
+            if soltada:
+                log(">>> HOTKEY RELEASED (push to talk) <<<")
+                if state["recording"]:
+                    threading.Thread(
+                        target=stop_and_transcribe,
+                        kwargs={"update_ui": update_ui}, daemon=True).start()
+            else:
+                log(">>> HOTKEY PRESSED (push to talk) <<<")
+                if not state["recording"]:
+                    start_recording(update_ui=update_ui)
+            return 0
+
+        if not soltada:
+            log(">>> HOTKEY PRESSED <<<")
+            toggle_recording(update_ui=update_ui)
         return 0
 
     handler_func = EventHandlerProc(_on_hotkey)
     _hotkey_refs.append(handler_func)
 
-    kEventClassKeyboard = 0x6B657962
-    kEventHotKeyPressed = 5
-    event_type = EventTypeSpec(kEventClassKeyboard, kEventHotKeyPressed)
+    kEventClassKeyboard  = 0x6B657962
+    kEventHotKeyPressed  = 5
+    # Se registran los DOS eventos: sin el de soltar no hay push to talk.
+    tipos = (EventTypeSpec * 2)(
+        EventTypeSpec(kEventClassKeyboard, kEventHotKeyPressed),
+        EventTypeSpec(kEventClassKeyboard, kEventHotKeyReleased),
+    )
     handler_ref = c_void_p()
 
     err = carbon.InstallEventHandler(
         carbon.GetApplicationEventTarget(), handler_func,
-        c_uint32(1), byref(event_type), None, byref(handler_ref),
+        c_uint32(2), tipos, None, byref(handler_ref),
     )
     if err != 0:
         log(f"InstallEventHandler failed: {err}")
@@ -367,6 +750,34 @@ def _start_hotkey_mac(update_ui=None):
         return
     _hotkey_refs.append(hotkey_ref)
     log(f"Carbon hotkey registered: {mod_name}+{key_name}")
+
+    # Escape vive solo durante la grabación. Registrarlo de forma permanente
+    # se lo quitaría a todas las apps del sistema.
+    esc = {"ref": None}
+
+    def _reg_esc():
+        if esc["ref"] is not None:
+            return
+        ref = c_void_p()
+        err = carbon.RegisterEventHotKey(
+            c_uint32(_KEYCODE_MAP["escape"]), c_uint32(0),
+            EventHotKeyID(0x51565F31, ID_CANCEL),
+            carbon.GetApplicationEventTarget(), c_uint32(0), byref(ref),
+        )
+        if err == 0:
+            esc["ref"] = ref
+        else:
+            log("RegisterEventHotKey(escape) failed: %d" % err)
+
+    def _lib_esc():
+        if esc["ref"] is None:
+            return
+        carbon.UnregisterEventHotKey(esc["ref"])
+        esc["ref"] = None
+
+    _escape_state["registrar"] = _reg_esc
+    _escape_state["liberar"] = _lib_esc
+    log("Escape disponible para cancelar durante la grabación")
 
 # ── Windows: pynput global hotkey ──
 
@@ -405,8 +816,25 @@ def _start_hotkey_windows(update_ui=None):
 
     def on_press(key):
         pressed_keys.add(key)
+
+        # Escape cancela, pero solo mientras se graba. A diferencia de macOS
+        # aquí no hace falta registrar ni liberar nada: pynput es un listener
+        # PASIVO, no se apropia de la tecla. La contrapartida es que el Escape
+        # también llega a la app que tenga el foco.
+        if key == keyboard.Key.esc and state["recording"]:
+            log(">>> ESCAPE <<<")
+            cancel_recording(update_ui=update_ui)
+            return
+
         mod_held = any(mk in pressed_keys for mk in mod_keys)
         if mod_held and key == main_key:
+            if settings.get("push_to_talk", False):
+                # Mantener presionado: la tecla se repite mientras se sostiene,
+                # así que solo cuenta la primera vez.
+                if not state["recording"]:
+                    log(">>> HOTKEY PRESSED (push to talk) <<<")
+                    start_recording(update_ui=update_ui)
+                return
             now = time.time()
             if now - _last_fire[0] > 0.4:   # debounce 400 ms
                 _last_fire[0] = now
@@ -415,12 +843,147 @@ def _start_hotkey_windows(update_ui=None):
 
     def on_release(key):
         pressed_keys.discard(key)
+        if not settings.get("push_to_talk", False):
+            return
+        # Soltar el modificador o la tecla principal cierra la grabación.
+        if (key == main_key or key in mod_keys) and state["recording"]:
+            log(">>> HOTKEY RELEASED (push to talk) <<<")
+            threading.Thread(
+                target=stop_and_transcribe,
+                kwargs={"update_ui": update_ui}, daemon=True).start()
 
     listener = keyboard.Listener(on_press=on_press, on_release=on_release)
     listener.daemon = True
     listener.start()
     _hotkey_refs.append(listener)
     log(f"pynput hotkey registered: {mod_name}+{key_name}")
+
+# ─── Inicio automático al iniciar sesión ─────────────────────────────────────
+
+BUNDLE_ID = "com.qstrauss.voice"
+
+
+def _ruta_ejecutable():
+    """Qué hay que lanzar al iniciar sesión.
+
+    Empaquetada es el binario dentro del .app; desde código fuente es run.sh,
+    que activa el venv antes de arrancar.
+    """
+    if getattr(sys, "frozen", False):
+        return sys.executable
+    r = os.path.join(BASE_DIR, "run.sh")
+    return r if os.path.exists(r) else sys.executable
+
+
+def configurar_inicio_automatico(activar):
+    """Registra o quita la app del arranque de sesión. True si quedó aplicado."""
+    try:
+        if IS_MAC:
+            destino = os.path.expanduser(
+                "~/Library/LaunchAgents/%s.plist" % BUNDLE_ID)
+            if not activar:
+                if os.path.exists(destino):
+                    os.remove(destino)
+                    log("Inicio automático desactivado")
+                return True
+            os.makedirs(os.path.dirname(destino), exist_ok=True)
+            plist = (
+                '<?xml version="1.0" encoding="UTF-8"?>\n'
+                '<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" '
+                '"http://www.apple.com/DTDs/PropertyList-1.0.dtd">\n'
+                '<plist version="1.0"><dict>\n'
+                '  <key>Label</key><string>%s</string>\n'
+                '  <key>ProgramArguments</key><array><string>%s</string></array>\n'
+                '  <key>RunAtLoad</key><true/>\n'
+                '</dict></plist>\n' % (BUNDLE_ID, _ruta_ejecutable())
+            )
+            with open(destino, "w", encoding="utf-8") as f:
+                f.write(plist)
+            log("Inicio automático activado: %s" % destino)
+            return True
+
+        if IS_WINDOWS:
+            import winreg
+            clave = r"Software\Microsoft\Windows\CurrentVersion\Run"
+            with winreg.OpenKey(winreg.HKEY_CURRENT_USER, clave, 0,
+                                winreg.KEY_SET_VALUE) as k:
+                if activar:
+                    winreg.SetValueEx(k, APP_NAME, 0, winreg.REG_SZ,
+                                      '"%s"' % _ruta_ejecutable())
+                    log("Inicio automático activado (registro)")
+                else:
+                    try:
+                        winreg.DeleteValue(k, APP_NAME)
+                        log("Inicio automático desactivado (registro)")
+                    except FileNotFoundError:
+                        pass
+            return True
+    except Exception as e:
+        log("No se pudo configurar el inicio automático: %s" % e)
+        return False
+    return False
+
+
+# ─── Descarga del modelo por inactividad ─────────────────────────────────────
+
+def _descargar_modelo():
+    """Libera el modelo de memoria tras un rato sin dictar.
+
+    En MLX el modelo vive en `ModelHolder`, un cache de clase dentro de
+    mlx_whisper. Vaciarlo es transparente: `state["model"]` guarda solo el
+    nombre del repo, asi que la siguiente transcripcion lo recarga sola.
+
+    En faster-whisper `state["model"]` ES el objeto, asi que hay que marcarlo
+    como descargado para que `start_recording` dispare la recarga y avise al
+    usuario mientras tanto.
+    """
+    import gc
+    backend = state.get("backend")
+    try:
+        if backend == "mlx":
+            from mlx_whisper.transcribe import ModelHolder
+            ModelHolder.model = None
+            ModelHolder.model_path = None
+            # Vaciar el ModelHolder no basta: MLX guarda los buffers en un
+            # pool de Metal propio. Medido con mx.get_active_memory(): el
+            # modelo ocupa 1618 MB y solo baja a 0 tras clear_cache().
+            try:
+                import mlx.core as mx
+                mx.clear_cache()
+            except Exception:
+                pass
+        else:
+            state["model"] = None
+            state["descargado"] = True
+        gc.collect()
+        log("Modelo descargado por inactividad (libera ~1.6 GB en MLX)")
+    except Exception as e:
+        log("No se pudo descargar el modelo: %s" % e)
+
+
+def _vigilar_inactividad():
+    """Hilo de fondo. Revisa cada 15 s si toca liberar el modelo."""
+    while True:
+        time.sleep(15)
+        try:
+            espera = int(settings.get("memory_timeout", 0) or 0)
+            if espera <= 0:
+                continue
+            if state["recording"] or state["transcribing"]:
+                continue
+            ultimo = state.get("ultimo_uso") or 0.0
+            if not ultimo:
+                continue
+            if time.time() - ultimo < espera:
+                continue
+            ya_libre = (state.get("backend") != "mlx" and state["model"] is None)
+            if ya_libre:
+                continue
+            _descargar_modelo()
+            state["ultimo_uso"] = 0.0
+        except Exception as e:
+            log("Vigilante de inactividad: %s" % e)
+
 
 # ─── Load model ──────────────────────────────────────────────────────────────
 
@@ -452,15 +1015,25 @@ def load_model():
     # Windows or MLX fallback
     cpu_threads = max(4, os.cpu_count() or 4)
     log(f"Loading faster-whisper '{model_name}' (cpu_threads={cpu_threads})...")
-    state["model"]   = WhisperModel(
-        model_name,
-        device="cpu",
-        compute_type="int8",
-        cpu_threads=cpu_threads,
-        num_workers=1,
-    )
-    state["backend"] = "faster_whisper"
-    log("faster-whisper ready (CPU)")
+    try:
+        state["model"] = WhisperModel(
+            model_name,
+            device="cpu",
+            compute_type="int8",
+            cpu_threads=cpu_threads,
+            num_workers=1,
+        )
+        state["backend"] = "faster_whisper"
+        state["model_error"] = None
+        log("faster-whisper ready (CPU)")
+    except Exception as e:
+        # Sin esto, load_model() corre en un hilo, la excepción se lo lleva sin
+        # dejar rastro, y la app queda inservible respondiendo "Model not ready
+        # yet" para siempre sin explicar por qué.
+        state["model_error"] = str(e)
+        log("ERROR AL CARGAR EL MODELO: %s" % e)
+        import traceback
+        log(traceback.format_exc())
 
 # ══════════════════════════════════════════════════════════════════════════════
 #  macOS — Invisible background app (PyObjC)
@@ -489,7 +1062,8 @@ if IS_MAC:
                 log(f"Audio stream FAILED: {e}")
 
             # Overlay (hidden until hotkey)
-            self._overlay = RecordingOverlay()
+            self._overlay = RecordingOverlay(
+                posicion=settings.get("overlay_position", "center"))
             log("Overlay created")
 
             # Settings window
@@ -497,15 +1071,23 @@ if IS_MAC:
                 on_setting_changed=self._on_setting_changed,
                 on_reload_dict=reload_dictionary,
             )
-            self._settings_win.show()
-            log("Settings window shown")
+            # La ventana de ajustes roba el foco al abrirse, y el pegado va a
+            # donde esté el foco. Con start_hidden la app arranca invisible y
+            # el primer dictado aterriza donde el usuario ya estaba.
+            if not settings.get("start_hidden", False):
+                self._settings_win.show()
+                log("Settings window shown")
+            else:
+                log("start_hidden: ventana de ajustes oculta al arrancar")
 
             # Load model in background
             threading.Thread(target=load_model, daemon=True).start()
             log("Model loading in background...")
+            threading.Thread(target=_vigilar_inactividad, daemon=True).start()
 
             # Carbon hotkey (no Accessibility needed)
             self._pending_status = None
+            self._no_speech_until = 0.0
             try:
                 start_hotkey_listener(update_ui=self._queue_status)
             except Exception as e:
@@ -515,6 +1097,12 @@ if IS_MAC:
             NSTimer.scheduledTimerWithTimeInterval_target_selector_userInfo_repeats_(
                 0.05, self, b"pollStatus:", None, True
             )
+            if not accesibilidad_ok(pedir=True):
+                log("FALTA PERMISO DE ACCESIBILIDAD. Sin él la app transcribe "
+                    "pero no puede pegar sola. Se abrió el diálogo del sistema.")
+            else:
+                log("Accesibilidad concedida: el pegado automático funcionará")
+
             log("App ready")
 
         def pollStatus_(self, timer):
@@ -522,6 +1110,12 @@ if IS_MAC:
             if status is not None:
                 self._pending_status = None
                 self._apply_status(status)
+            elif self._no_speech_until and time.time() >= self._no_speech_until:
+                # El aviso "sin voz" se cierra solo. Se reusa este timer de
+                # 50 ms en vez de crear uno nuevo: menos piezas móviles y ya
+                # corre en el hilo principal, que es donde vive el overlay.
+                self._no_speech_until = 0.0
+                self._overlay.hide()
 
         @objc.python_method
         def _queue_status(self, status):
@@ -534,12 +1128,18 @@ if IS_MAC:
             """Runs on main thread."""
             log(f"_apply_status: {status}")
             if status == "recording":
+                self._no_speech_until = 0.0
                 self._overlay.show("listening")
             elif status == "transcribing":
                 # Always call show() — overlay may be hidden if "recording"
                 # status was skipped by the single-slot _pending_status queue
+                self._no_speech_until = 0.0
                 self._overlay.show("transcribing")
+            elif status in ("no_speech", "portapapeles", "sin_permiso", "cargando"):
+                self._overlay.show(status)
+                self._no_speech_until = time.time() + NO_SPEECH_FLASH_S
             else:
+                self._no_speech_until = 0.0
                 self._overlay.hide()
 
         @objc.python_method
@@ -547,6 +1147,10 @@ if IS_MAC:
             global settings
             settings[key] = value
             save_settings(settings)
+            if key == "overlay_position":
+                self._overlay.set_posicion(value)
+            if key == "launch_at_login":
+                configurar_inicio_automatico(bool(value))
             if key == "whisper_model":
                 state["model"] = None
                 threading.Thread(target=load_model, daemon=True).start()
@@ -686,6 +1290,8 @@ elif IS_WINDOWS:
         def _on_setting_changed(key, value):
             global settings
             settings[key] = value
+            if key == "launch_at_login":
+                configurar_inicio_automatico(bool(value))
             if key == "whisper_model":
                 state["model"] = None
                 threading.Thread(target=load_model, daemon=True).start()
@@ -734,6 +1340,9 @@ function draw(){
       ctx.fillStyle='rgba(0,200,150,'+al+')';
       ctx.beginPath();ctx.arc(14+i*(252/17),cy+dy,3.5,0,Math.PI*2);ctx.fill();
     }
+  }else if(status==='no_speech'||status==='portapapeles'||status==='sin_permiso'||status==='cargando'){
+    ctx.strokeStyle='rgba(140,153,179,.85)';ctx.lineWidth=2;
+    ctx.beginPath();ctx.moveTo(14,cy);ctx.lineTo(266,cy);ctx.stroke();
   }else{
     for(var i=0;i<3;i++){
       var ph=i*(Math.PI*2/3),dy=Math.sin(phase*.14+ph)*6,al=.5+.5*Math.abs(Math.sin(phase*.14+ph));
@@ -746,7 +1355,8 @@ function draw(){
 draw();
 function setStatus(s){
   status=s;
-  document.getElementById('hint').textContent=s==='listening'?'Presiona el atajo para detener':'Un momento…';
+  var h={listening:'Presiona el atajo para detener',no_speech:'No se detecto voz',portapapeles:'Copiado, pega con Ctrl+V',sin_permiso:'Falta permiso, pega con Ctrl+V',cargando:'Cargando el modelo, espera'};
+  document.getElementById('hint').textContent=h[s]||'Un momento…';
 }
 </script></body></html>"""
 
@@ -799,6 +1409,7 @@ function setStatus(s){
             def _load_and_notify():
                 load_model()
                 _pending["model_ready"] = True
+                threading.Thread(target=_vigilar_inactividad, daemon=True).start()
             threading.Thread(target=_load_and_notify, daemon=True).start()
 
             def queue_status(s):
@@ -806,6 +1417,8 @@ function setStatus(s){
             start_hotkey_listener(update_ui=queue_status)
 
             # Poll thread: model ready + overlay status
+            _no_speech_until = [0.0]
+
             def _poll():
                 while True:
                     if _pending["model_ready"]:
@@ -818,12 +1431,25 @@ function setStatus(s){
                         _pending["status"] = None
                         try:
                             if s == "recording":
+                                _no_speech_until[0] = 0.0
                                 overlay_win.show()
                                 overlay_win.evaluate_js("setStatus('listening')")
                             elif s == "transcribing":
+                                _no_speech_until[0] = 0.0
                                 overlay_win.evaluate_js("setStatus('transcribing')")
+                            elif s in ("no_speech", "portapapeles", "sin_permiso", "cargando"):
+                                overlay_win.show()
+                                overlay_win.evaluate_js("setStatus('%s')" % s)
+                                _no_speech_until[0] = time.time() + NO_SPEECH_FLASH_S
                             else:
+                                _no_speech_until[0] = 0.0
                                 overlay_win.hide()
+                        except Exception as e:
+                            log(f"overlay error: {e}")
+                    elif _no_speech_until[0] and time.time() >= _no_speech_until[0]:
+                        _no_speech_until[0] = 0.0
+                        try:
+                            overlay_win.hide()
                         except Exception as e:
                             log(f"overlay error: {e}")
                     time.sleep(0.05)
@@ -871,7 +1497,7 @@ function setStatus(s){
 
 # ─── Main ────────────────────────────────────────────────────────────────────
 
-LOG_FILE = os.path.join(BASE_DIR, "app.log")
+LOG_FILE = os.path.join(DATA_DIR, "app.log")
 
 def log(msg):
     """Write to both stdout and log file for debugging."""
@@ -879,7 +1505,7 @@ def log(msg):
     with open(LOG_FILE, "a", encoding="utf-8") as f:
         f.write(f"{time.strftime('%H:%M:%S')} {msg}\n")
 
-LOCK_FILE = os.path.join(BASE_DIR, "app.lock")
+LOCK_FILE = os.path.join(DATA_DIR, "app.lock")
 
 def _acquire_lock():
     """Single-instance lock. Returns False if another instance is already running."""
@@ -908,6 +1534,13 @@ def main():
     log(f"Hotkey: {settings.get('hotkey_display', '⌥ Space')}")
 
     reload_dictionary()
+
+    # Sincronizar el inicio automático con lo que dice el ajuste. Sin esto,
+    # el estado real y el declarado se separan en silencio: basta que algo
+    # borre el plist (o la entrada de registro) para que el interruptor siga
+    # en "activado" sin estarlo.
+    if settings.get("launch_at_login", False):
+        configurar_inicio_automatico(True)
 
     if IS_MAC:
         run_mac()

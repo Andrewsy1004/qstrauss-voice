@@ -449,11 +449,41 @@
     </div>
   </div>
 
+  <div class="section-title">DETECCI&Oacute;N DE VOZ</div>
+  <div class="card">
+    <div class="row">
+      <div class="row-left">Filtrar Silencio <span class="info-icon" title="Descarta el audio sin voz antes de transcribir. Sin esto, Whisper inventa frases sobre el silencio.">i</span></div>
+      <div class="row-right">
+        <div class="toggle on" id="vad-enabled" onclick="toggleSwitch(this, 'vad_enabled')"></div>
+      </div>
+    </div>
+    <div class="row">
+      <div class="row-left">Sensibilidad <span class="info-icon" title="Qu&eacute; tan seguro debe estar de que hay voz. Estricto descarta m&aacute;s; Permisivo transcribe m&aacute;s pero puede colar ruido.">i</span></div>
+      <div class="row-right">
+        <select id="vad-threshold" onchange="setSetting('vad_threshold', parseFloat(this.value))">
+          <option value="0.75">Estricto</option>
+          <option value="0.65" selected>Normal</option>
+          <option value="0.5">Permisivo</option>
+        </select>
+      </div>
+    </div>
+  </div>
+
   <div class="section-title">DICCIONARIO</div>
   <div class="card">
     <div class="row">
       <div class="row-left">Correcciones activas</div>
       <div class="row-right"><span id="dict-count" style="color:#3a4e72">&mdash;</span></div>
+    </div>
+    <div class="row">
+      <div class="row-left">Correcci&oacute;n Aproximada <span class="info-icon" title="Corrige t&eacute;rminos mal o&iacute;dos aunque no est&eacute;n listados, y une palabras partidas como work front. Requiere el diccionario del sistema en espa&ntilde;ol.">i</span></div>
+      <div class="row-right">
+        <div class="toggle on" id="fuzzy-terms" onclick="toggleSwitch(this, 'fuzzy_terms')"></div>
+      </div>
+    </div>
+    <div class="row">
+      <div class="row-left" style="color:#3a4e72; font-size:11px">Diccionario del sistema</div>
+      <div class="row-right"><span id="lexico-estado" style="color:#3a4e72; font-size:11px">&mdash;</span></div>
     </div>
     <div class="row">
       <div class="row-left">Recargar Diccionario <span class="info-icon" title="Recarga dictionary.json sin reiniciar">i</span></div>
@@ -500,26 +530,22 @@
     </div>
   </div>
 
-  <div class="section-title">HISTORIAL</div>
+  <div class="section-title">PRIVACIDAD</div>
   <div class="card">
     <div class="row">
-      <div class="row-left">L&iacute;mite de Historial <span class="info-icon" title="N&uacute;mero m&aacute;ximo de transcripciones guardadas">i</span></div>
-      <div class="row-right">
-        <div class="stepper">
-          <input type="number" id="history-limit" value="5" min="1" max="50" onchange="setSetting('history_limit', parseInt(this.value))">
-          <span class="stepper-label">entradas</span>
-        </div>
-      </div>
+      <div class="row-left">Grabaciones guardadas</div>
+      <div class="row-right"><span style="color:#00c896">ninguna</span></div>
     </div>
     <div class="row">
-      <div class="row-left">Eliminaci&oacute;n autom&aacute;tica de grabaciones <span class="info-icon" title="Pol&iacute;tica de retenci&oacute;n del historial">i</span></div>
-      <div class="row-right">
-        <select id="history-retention" onchange="setSetting('history_retention', this.value)">
-          <option value="keep_last">Mantener las &uacute;ltimas 5</option>
-          <option value="keep_session">Solo sesi&oacute;n actual</option>
-          <option value="keep_none">No guardar</option>
-        </select>
+      <div class="row-left">Historial de transcripciones</div>
+      <div class="row-right"><span style="color:#00c896">no se guarda</span></div>
+    </div>
+    <div class="row">
+      <div class="row-left" style="color:#3a4e72; font-size:11px; line-height:1.5">
+        El audio se procesa en tu equipo y se descarta al terminar. El texto va
+        al portapapeles y nada sale a internet.
       </div>
+      <div class="row-right"></div>
     </div>
   </div>
 
@@ -709,6 +735,17 @@
   function loadSettings(cfg) {
     setToggle('push-to-talk', cfg.push_to_talk);
     setToggle('trailing-space', cfg.trailing_space !== false);
+    setToggle('vad-enabled', cfg.vad_enabled !== false);
+    setToggle('fuzzy-terms', cfg.fuzzy_terms !== false);
+    if (cfg.vad_threshold !== undefined) {
+      // El <select> compara strings: 0.5 debe quedar como "0.5", no "0.50".
+      document.getElementById('vad-threshold').value = String(cfg.vad_threshold);
+    }
+    if (cfg.lexico_ok !== undefined) {
+      var le = document.getElementById('lexico-estado');
+      le.textContent = cfg.lexico_ok ? 'disponible' : 'no disponible en este sistema';
+      le.style.color = cfg.lexico_ok ? '#00c896' : '#7a5a3a';
+    }
 
     if (cfg.language) document.getElementById('language').value = cfg.language;
     if (cfg.whisper_model) document.getElementById('whisper-model').value = cfg.whisper_model;
@@ -721,8 +758,6 @@
     if (cfg.overlay_position) document.getElementById('overlay-position').value = cfg.overlay_position;
     if (cfg.memory_timeout !== undefined) document.getElementById('memory-mgmt').value = String(cfg.memory_timeout);
 
-    if (cfg.history_limit) document.getElementById('history-limit').value = cfg.history_limit;
-    if (cfg.history_retention) document.getElementById('history-retention').value = cfg.history_retention;
 
     if (cfg.app_language) document.getElementById('app-language').value = cfg.app_language;
 

@@ -25,6 +25,12 @@ pyinstaller ^
   --add-data "dictionary.json;." ^
   --add-data "resources;resources" ^
   --add-data "settings_window_win.py;." ^
+  --add-data "vad.py;." ^
+  --add-data "terms.py;." ^
+  --hidden-import "vad" ^
+  --hidden-import "terms" ^
+  --hidden-import "spylls" ^
+  --hidden-import "onnxruntime" ^
   --hidden-import "faster_whisper" ^
   --hidden-import "ctranslate2" ^
   --hidden-import "tokenizers" ^
@@ -35,6 +41,8 @@ pyinstaller ^
   --hidden-import "pystray._win32" ^
   --hidden-import "webview" ^
   --collect-all "webview" ^
+  --collect-all "spylls" ^
+  --collect-all "onnxruntime" ^
   --collect-all "faster_whisper" ^
   --collect-all "ctranslate2" ^
   voice_typer.py

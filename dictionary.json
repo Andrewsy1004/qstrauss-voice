@@ -1,23 +1,45 @@
 {
-  "_comment": "QStrauss Voice — Diccionario personalizado de la empresa",
-
+  "_comment": [
+    "QStrauss Voice — Diccionario de la empresa. Dos capas complementarias.",
+    "",
+    "hints: sesga el decoder de Whisper (initial_prompt) Y es el corpus contra",
+    "  el que terms.py compara terminos mal oidos. Es la FUENTE DE VERDAD:",
+    "  para un termino nuevo, agregarlo aqui suele bastar.",
+    "",
+    "corrections: reemplazo exacto, se aplica ANTES de lo difuso y siempre gana.",
+    "  Solo quedan aqui los errores FONETICOS, que la distancia de edicion no",
+    "  puede alcanzar por construccion:",
+    "     eicher -> Azure   5 ediciones sobre 6 letras (ratio 0.83)",
+    "     aser   -> Azure   ratio 0.60",
+    "     tims   -> Teams   ratio 0.40",
+    "  El umbral de terms.py es 0.34, asi que ninguno entra por ahi.",
+    "",
+    "Se podaron 8 entradas el 2026-08-25 (workfron, work front, work fron,",
+    "q strauss, custrauss, qs trous, ay sure, microsoft tim) porque terms.py ya",
+    "las cubre por distancia de edicion. Antes no se podian quitar: el guard",
+    "lexico usaba NSSpellChecker y en Windows la capa difusa no existia. Ahora",
+    "el diccionario hunspell va empaquetado en resources/dic/ y funciona igual",
+    "en las dos plataformas.",
+    "",
+    "Medido tambien: large-v3-turbo acierta 8 de 11 terminos SIN correccion."
+  ],
   "corrections": {
-    "workfron":     "Workfront",
-    "work front":   "Workfront",
-    "work fron":    "Workfront",
-    "q strauss":    "QStrauss",
-    "custrauss":    "QStrauss",
-    "qs trous":     "QStrauss",
-    "eicher":       "Azure",
-    "aser":         "Azure",
-    "ay sure":      "Azure",
-    "microsoft tim": "Microsoft Teams",
-    "tims":         "Teams"
+    "eicher": "Azure",
+    "aser": "Azure",
+    "tims": "Teams"
   },
-
   "hints": [
-    "Workfront", "QStrauss", "Azure", "Microsoft Teams",
-    "Fusion", "API", "Claude", "Anthropic",
-    "intake", "workflow", "chatbot", "deployment"
+    "Workfront",
+    "QStrauss",
+    "Azure",
+    "Microsoft Teams",
+    "Fusion",
+    "API",
+    "Claude",
+    "Anthropic",
+    "intake",
+    "workflow",
+    "chatbot",
+    "deployment"
   ]
 }

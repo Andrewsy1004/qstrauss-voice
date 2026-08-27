@@ -14,7 +14,20 @@ from WebKit import WKWebView, WKWebViewConfiguration, WKUserContentController
 IS_MAC = sys.platform == "darwin"
 
 BASE_DIR = os.path.dirname(os.path.abspath(__file__))
-SETTINGS_FILE = os.path.join(BASE_DIR, "settings.json")
+def _ruta_settings():
+    """Misma ruta que usa voice_typer, para que no haya dos escritores.
+
+    La importación es diferida a propósito: voice_typer importa este módulo,
+    así que hacerlo arriba crearía un ciclo.
+    """
+    try:
+        from voice_typer import SETTINGS_FILE as ruta
+        return ruta
+    except Exception:
+        return os.path.join(BASE_DIR, "settings.json")
+
+
+SETTINGS_FILE = _ruta_settings()
 HTML_FILE = os.path.join(BASE_DIR, "resources", "settings.html")
 
 DEFAULT_SETTINGS = {
@@ -29,6 +42,9 @@ DEFAULT_SETTINGS = {
     "push_to_talk": False,
     "overlay_position": "center",
     "app_language": "es",
+    "vad_enabled": True,
+    "vad_threshold": 0.65,
+    "fuzzy_terms": True,
 }
 
 
@@ -137,6 +153,14 @@ class SettingsWindow:
         cfg = dict(self._config)
         cfg["microphones"] = _list_microphones()
         cfg["dict_count"] = self._count_dict_entries()
+        # El guard léxico de la corrección aproximada usa NSSpellChecker, que
+        # solo existe en macOS. Sin él la función no hace nada, así que la UI
+        # lo dice en vez de mostrar un interruptor que miente.
+        try:
+            import terms
+            cfg["lexico_ok"] = terms.Lexico().disponible
+        except Exception:
+            cfg["lexico_ok"] = False
         try:
             from voice_typer import state
             cfg["model_ready"] = state["model"] is not None
