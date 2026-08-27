@@ -137,6 +137,8 @@ state = {
     # cambió. Evita la carrera de cancelar mientras el modelo ya corre.
     "gen":            0,
     "model_error":    None,
+    "ultimo_uso":     0.0,
+    "descargado":     False,
     "model":          None,
     "backend":        "faster_whisper",  # "mlx" on Apple Silicon, "faster_whisper" on Windows
 }
@@ -336,6 +338,14 @@ def _pegar_en_cursor():
 def start_recording(update_ui=None):
     global _audio_cb_count
     log(f"start_recording called (audio_cb_count={_audio_cb_count}, stream_active={audio_stream.active if audio_stream else 'None'})")
+    if state["model"] is None and state.get("descargado"):
+        log("Modelo descargado por inactividad, recargando")
+        state["descargado"] = False
+        threading.Thread(target=load_model, daemon=True).start()
+        if update_ui:
+            update_ui("cargando")
+        return
+
     if state["model"] is None:
         err = state.get("model_error")
         if err:
@@ -503,6 +513,7 @@ def _stop_and_transcribe(update_ui=None):
     if settings.get("trailing_space", True):
         text += " "
 
+    state["ultimo_uso"] = time.time()
     log(f"Transcribed: {text.strip()}")
 
     with lock:
@@ -511,6 +522,12 @@ def _stop_and_transcribe(update_ui=None):
             return
 
     pyperclip.copy(text)
+
+    if settings.get("paste_mode") == "clipboard_only":
+        log("Modo 'solo portapapeles': no se pega automáticamente")
+        if update_ui:
+            update_ui("portapapeles")
+        return
 
     hay_destino = _restaurar_foco()
     if not hay_destino and IS_MAC:
@@ -799,6 +816,67 @@ def _start_hotkey_windows(update_ui=None):
     _hotkey_refs.append(listener)
     log(f"pynput hotkey registered: {mod_name}+{key_name}")
 
+# ─── Descarga del modelo por inactividad ─────────────────────────────────────
+
+def _descargar_modelo():
+    """Libera el modelo de memoria tras un rato sin dictar.
+
+    En MLX el modelo vive en `ModelHolder`, un cache de clase dentro de
+    mlx_whisper. Vaciarlo es transparente: `state["model"]` guarda solo el
+    nombre del repo, asi que la siguiente transcripcion lo recarga sola.
+
+    En faster-whisper `state["model"]` ES el objeto, asi que hay que marcarlo
+    como descargado para que `start_recording` dispare la recarga y avise al
+    usuario mientras tanto.
+    """
+    import gc
+    backend = state.get("backend")
+    try:
+        if backend == "mlx":
+            from mlx_whisper.transcribe import ModelHolder
+            ModelHolder.model = None
+            ModelHolder.model_path = None
+            # Vaciar el ModelHolder no basta: MLX guarda los buffers en un
+            # pool de Metal propio. Medido con mx.get_active_memory(): el
+            # modelo ocupa 1618 MB y solo baja a 0 tras clear_cache().
+            try:
+                import mlx.core as mx
+                mx.clear_cache()
+            except Exception:
+                pass
+        else:
+            state["model"] = None
+            state["descargado"] = True
+        gc.collect()
+        log("Modelo descargado por inactividad (libera ~1.6 GB en MLX)")
+    except Exception as e:
+        log("No se pudo descargar el modelo: %s" % e)
+
+
+def _vigilar_inactividad():
+    """Hilo de fondo. Revisa cada 15 s si toca liberar el modelo."""
+    while True:
+        time.sleep(15)
+        try:
+            espera = int(settings.get("memory_timeout", 0) or 0)
+            if espera <= 0:
+                continue
+            if state["recording"] or state["transcribing"]:
+                continue
+            ultimo = state.get("ultimo_uso") or 0.0
+            if not ultimo:
+                continue
+            if time.time() - ultimo < espera:
+                continue
+            ya_libre = (state.get("backend") != "mlx" and state["model"] is None)
+            if ya_libre:
+                continue
+            _descargar_modelo()
+            state["ultimo_uso"] = 0.0
+        except Exception as e:
+            log("Vigilante de inactividad: %s" % e)
+
+
 # ─── Load model ──────────────────────────────────────────────────────────────
 
 _MLX_MODEL_MAP = {
@@ -876,7 +954,8 @@ if IS_MAC:
                 log(f"Audio stream FAILED: {e}")
 
             # Overlay (hidden until hotkey)
-            self._overlay = RecordingOverlay()
+            self._overlay = RecordingOverlay(
+                posicion=settings.get("overlay_position", "center"))
             log("Overlay created")
 
             # Settings window
@@ -896,6 +975,7 @@ if IS_MAC:
             # Load model in background
             threading.Thread(target=load_model, daemon=True).start()
             log("Model loading in background...")
+            threading.Thread(target=_vigilar_inactividad, daemon=True).start()
 
             # Carbon hotkey (no Accessibility needed)
             self._pending_status = None
@@ -959,6 +1039,8 @@ if IS_MAC:
             global settings
             settings[key] = value
             save_settings(settings)
+            if key == "overlay_position":
+                self._overlay.set_posicion(value)
             if key == "whisper_model":
                 state["model"] = None
                 threading.Thread(target=load_model, daemon=True).start()
@@ -1215,6 +1297,7 @@ function setStatus(s){
             def _load_and_notify():
                 load_model()
                 _pending["model_ready"] = True
+                threading.Thread(target=_vigilar_inactividad, daemon=True).start()
             threading.Thread(target=_load_and_notify, daemon=True).start()
 
             def queue_status(s):

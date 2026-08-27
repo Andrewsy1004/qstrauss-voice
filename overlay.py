@@ -132,12 +132,22 @@ class _OverlayView(AppKit.NSView):
         self.setNeedsDisplay_(True)
 
 
+# Fraccion de la altura de pantalla donde se ancla el borde inferior del
+# overlay, segun el ajuste "Ventana de Grabacion".
+_POSICIONES = {"bottom": 0.08, "center": 0.45, "top": 0.82}
+
+
+def _alto_relativo(posicion):
+    return _POSICIONES.get(posicion, _POSICIONES["center"])
+
+
 class RecordingOverlay:
-    def __init__(self):
+    def __init__(self, posicion="center"):
+        self.posicion = posicion
         W, H = 300, 52          # Slim pill — very minimal
         screen = AppKit.NSScreen.mainScreen().frame()
         x = (screen.size.width - W) / 2
-        y = screen.size.height * 0.12  # Near bottom of screen
+        y = screen.size.height * _alto_relativo(posicion)
 
         self._panel = AppKit.NSPanel.alloc().initWithContentRect_styleMask_backing_defer_(
             NSMakeRect(x, y, W, H),
@@ -171,7 +181,7 @@ class RecordingOverlay:
         W = self._panel.frame().size.width
         H = self._panel.frame().size.height
         x = (screen.size.width - W) / 2
-        y = screen.size.height * 0.12
+        y = screen.size.height * _alto_relativo(self.posicion)
         self._panel.setFrame_display_(NSMakeRect(x, y, W, H), True)
         self._panel.orderFront_(None)
         if self._timer is None:
@@ -180,6 +190,10 @@ class RecordingOverlay:
                     0.04, self._view, b"tick:", None, True
                 )
             )
+
+    def set_posicion(self, posicion):
+        """Se aplica en el siguiente show(), sin reiniciar la app."""
+        self.posicion = posicion
 
     def set_status(self, status):
         self._view.setStatus(status)

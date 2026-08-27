@@ -33,8 +33,6 @@ DEFAULT_SETTINGS = {
     "start_hidden":     False,
     "launch_at_login":  False,
     "memory_timeout":   0,
-    "history_limit":    5,
-    "history_retention": "keep_last",
     "vad_enabled":      True,
     "vad_threshold":    0.65,
     "fuzzy_terms":      True,

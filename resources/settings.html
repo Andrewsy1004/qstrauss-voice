@@ -530,26 +530,22 @@
     </div>
   </div>
 
-  <div class="section-title">HISTORIAL</div>
+  <div class="section-title">PRIVACIDAD</div>
   <div class="card">
     <div class="row">
-      <div class="row-left">L&iacute;mite de Historial <span class="info-icon" title="N&uacute;mero m&aacute;ximo de transcripciones guardadas">i</span></div>
-      <div class="row-right">
-        <div class="stepper">
-          <input type="number" id="history-limit" value="5" min="1" max="50" onchange="setSetting('history_limit', parseInt(this.value))">
-          <span class="stepper-label">entradas</span>
-        </div>
-      </div>
+      <div class="row-left">Grabaciones guardadas</div>
+      <div class="row-right"><span style="color:#00c896">ninguna</span></div>
     </div>
     <div class="row">
-      <div class="row-left">Eliminaci&oacute;n autom&aacute;tica de grabaciones <span class="info-icon" title="Pol&iacute;tica de retenci&oacute;n del historial">i</span></div>
-      <div class="row-right">
-        <select id="history-retention" onchange="setSetting('history_retention', this.value)">
-          <option value="keep_last">Mantener las &uacute;ltimas 5</option>
-          <option value="keep_session">Solo sesi&oacute;n actual</option>
-          <option value="keep_none">No guardar</option>
-        </select>
+      <div class="row-left">Historial de transcripciones</div>
+      <div class="row-right"><span style="color:#00c896">no se guarda</span></div>
+    </div>
+    <div class="row">
+      <div class="row-left" style="color:#3a4e72; font-size:11px; line-height:1.5">
+        El audio se procesa en tu equipo y se descarta al terminar. El texto va
+        al portapapeles y nada sale a internet.
       </div>
+      <div class="row-right"></div>
     </div>
   </div>
 
@@ -762,8 +758,6 @@
     if (cfg.overlay_position) document.getElementById('overlay-position').value = cfg.overlay_position;
     if (cfg.memory_timeout !== undefined) document.getElementById('memory-mgmt').value = String(cfg.memory_timeout);
 
-    if (cfg.history_limit) document.getElementById('history-limit').value = cfg.history_limit;
-    if (cfg.history_retention) document.getElementById('history-retention').value = cfg.history_retention;
 
     if (cfg.app_language) document.getElementById('app-language').value = cfg.app_language;
 
