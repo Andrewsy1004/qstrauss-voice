@@ -665,9 +665,12 @@ def _start_hotkey_mac(update_ui=None):
         c_void_p, c_uint32, c_uint32, c_void_p, c_uint32, c_void_p, c_void_p,
     ]
     carbon.GetEventParameter.restype = c_int32
+    carbon.GetEventKind.argtypes = [c_void_p]
+    carbon.GetEventKind.restype = c_uint32
 
     EventHandlerProc = CFUNCTYPE(c_int32, c_void_p, c_void_p, c_void_p)
 
+    kEventHotKeyReleased = 6
     kEventParamDirectObject = 0x6F626A20   # 'obj '
     typeEventHotKeyID       = 0x686B6964   # 'hkid'
     ID_TOGGLE, ID_CANCEL = 1, 2
@@ -682,10 +685,30 @@ def _start_hotkey_mac(update_ui=None):
 
     def _on_hotkey(next_handler, event, user_data):
         cual = _quien_disparo(event)
+        soltada = carbon.GetEventKind(event) == kEventHotKeyReleased
+
         if cual == ID_CANCEL:
-            log(">>> ESCAPE <<<")
-            cancel_recording(update_ui=update_ui)
-        else:
+            if not soltada:
+                log(">>> ESCAPE <<<")
+                cancel_recording(update_ui=update_ui)
+            return 0
+
+        # Mantener presionado: pulsar graba, soltar transcribe. Sin esto, el
+        # atajo alterna y hay que pulsarlo dos veces.
+        if settings.get("push_to_talk", False):
+            if soltada:
+                log(">>> HOTKEY RELEASED (push to talk) <<<")
+                if state["recording"]:
+                    threading.Thread(
+                        target=stop_and_transcribe,
+                        kwargs={"update_ui": update_ui}, daemon=True).start()
+            else:
+                log(">>> HOTKEY PRESSED (push to talk) <<<")
+                if not state["recording"]:
+                    start_recording(update_ui=update_ui)
+            return 0
+
+        if not soltada:
             log(">>> HOTKEY PRESSED <<<")
             toggle_recording(update_ui=update_ui)
         return 0
@@ -693,14 +716,18 @@ def _start_hotkey_mac(update_ui=None):
     handler_func = EventHandlerProc(_on_hotkey)
     _hotkey_refs.append(handler_func)
 
-    kEventClassKeyboard = 0x6B657962
-    kEventHotKeyPressed = 5
-    event_type = EventTypeSpec(kEventClassKeyboard, kEventHotKeyPressed)
+    kEventClassKeyboard  = 0x6B657962
+    kEventHotKeyPressed  = 5
+    # Se registran los DOS eventos: sin el de soltar no hay push to talk.
+    tipos = (EventTypeSpec * 2)(
+        EventTypeSpec(kEventClassKeyboard, kEventHotKeyPressed),
+        EventTypeSpec(kEventClassKeyboard, kEventHotKeyReleased),
+    )
     handler_ref = c_void_p()
 
     err = carbon.InstallEventHandler(
         carbon.GetApplicationEventTarget(), handler_func,
-        c_uint32(1), byref(event_type), None, byref(handler_ref),
+        c_uint32(2), tipos, None, byref(handler_ref),
     )
     if err != 0:
         log(f"InstallEventHandler failed: {err}")
@@ -801,6 +828,13 @@ def _start_hotkey_windows(update_ui=None):
 
         mod_held = any(mk in pressed_keys for mk in mod_keys)
         if mod_held and key == main_key:
+            if settings.get("push_to_talk", False):
+                # Mantener presionado: la tecla se repite mientras se sostiene,
+                # así que solo cuenta la primera vez.
+                if not state["recording"]:
+                    log(">>> HOTKEY PRESSED (push to talk) <<<")
+                    start_recording(update_ui=update_ui)
+                return
             now = time.time()
             if now - _last_fire[0] > 0.4:   # debounce 400 ms
                 _last_fire[0] = now
@@ -809,12 +843,86 @@ def _start_hotkey_windows(update_ui=None):
 
     def on_release(key):
         pressed_keys.discard(key)
+        if not settings.get("push_to_talk", False):
+            return
+        # Soltar el modificador o la tecla principal cierra la grabación.
+        if (key == main_key or key in mod_keys) and state["recording"]:
+            log(">>> HOTKEY RELEASED (push to talk) <<<")
+            threading.Thread(
+                target=stop_and_transcribe,
+                kwargs={"update_ui": update_ui}, daemon=True).start()
 
     listener = keyboard.Listener(on_press=on_press, on_release=on_release)
     listener.daemon = True
     listener.start()
     _hotkey_refs.append(listener)
     log(f"pynput hotkey registered: {mod_name}+{key_name}")
+
+# ─── Inicio automático al iniciar sesión ─────────────────────────────────────
+
+BUNDLE_ID = "com.qstrauss.voice"
+
+
+def _ruta_ejecutable():
+    """Qué hay que lanzar al iniciar sesión.
+
+    Empaquetada es el binario dentro del .app; desde código fuente es run.sh,
+    que activa el venv antes de arrancar.
+    """
+    if getattr(sys, "frozen", False):
+        return sys.executable
+    r = os.path.join(BASE_DIR, "run.sh")
+    return r if os.path.exists(r) else sys.executable
+
+
+def configurar_inicio_automatico(activar):
+    """Registra o quita la app del arranque de sesión. True si quedó aplicado."""
+    try:
+        if IS_MAC:
+            destino = os.path.expanduser(
+                "~/Library/LaunchAgents/%s.plist" % BUNDLE_ID)
+            if not activar:
+                if os.path.exists(destino):
+                    os.remove(destino)
+                    log("Inicio automático desactivado")
+                return True
+            os.makedirs(os.path.dirname(destino), exist_ok=True)
+            plist = (
+                '<?xml version="1.0" encoding="UTF-8"?>\n'
+                '<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" '
+                '"http://www.apple.com/DTDs/PropertyList-1.0.dtd">\n'
+                '<plist version="1.0"><dict>\n'
+                '  <key>Label</key><string>%s</string>\n'
+                '  <key>ProgramArguments</key><array><string>%s</string></array>\n'
+                '  <key>RunAtLoad</key><true/>\n'
+                '</dict></plist>\n' % (BUNDLE_ID, _ruta_ejecutable())
+            )
+            with open(destino, "w", encoding="utf-8") as f:
+                f.write(plist)
+            log("Inicio automático activado: %s" % destino)
+            return True
+
+        if IS_WINDOWS:
+            import winreg
+            clave = r"Software\Microsoft\Windows\CurrentVersion\Run"
+            with winreg.OpenKey(winreg.HKEY_CURRENT_USER, clave, 0,
+                                winreg.KEY_SET_VALUE) as k:
+                if activar:
+                    winreg.SetValueEx(k, APP_NAME, 0, winreg.REG_SZ,
+                                      '"%s"' % _ruta_ejecutable())
+                    log("Inicio automático activado (registro)")
+                else:
+                    try:
+                        winreg.DeleteValue(k, APP_NAME)
+                        log("Inicio automático desactivado (registro)")
+                    except FileNotFoundError:
+                        pass
+            return True
+    except Exception as e:
+        log("No se pudo configurar el inicio automático: %s" % e)
+        return False
+    return False
+
 
 # ─── Descarga del modelo por inactividad ─────────────────────────────────────
 
@@ -1041,6 +1149,8 @@ if IS_MAC:
             save_settings(settings)
             if key == "overlay_position":
                 self._overlay.set_posicion(value)
+            if key == "launch_at_login":
+                configurar_inicio_automatico(bool(value))
             if key == "whisper_model":
                 state["model"] = None
                 threading.Thread(target=load_model, daemon=True).start()
@@ -1180,6 +1290,8 @@ elif IS_WINDOWS:
         def _on_setting_changed(key, value):
             global settings
             settings[key] = value
+            if key == "launch_at_login":
+                configurar_inicio_automatico(bool(value))
             if key == "whisper_model":
                 state["model"] = None
                 threading.Thread(target=load_model, daemon=True).start()
@@ -1422,6 +1534,13 @@ def main():
     log(f"Hotkey: {settings.get('hotkey_display', '⌥ Space')}")
 
     reload_dictionary()
+
+    # Sincronizar el inicio automático con lo que dice el ajuste. Sin esto,
+    # el estado real y el declarado se separan en silencio: basta que algo
+    # borre el plist (o la entrada de registro) para que el interruptor siga
+    # en "activado" sin estarlo.
+    if settings.get("launch_at_login", False):
+        configurar_inicio_automatico(True)
 
     if IS_MAC:
         run_mac()
