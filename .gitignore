@@ -11,3 +11,7 @@ settings.json
 
 # macOS app bundle (built artifact — launch from /Applications/)
 *.app/
+
+# Artefactos de empaquetado
+QStrauss-Voice-mac.zip
+QStrauss-Voice-win.zip

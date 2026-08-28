@@ -25,53 +25,11 @@ jobs:
           pip install pyinstaller Pillow
           pip install pyobjc-framework-Cocoa pyobjc-framework-WebKit pyobjc-framework-Quartz
 
-      - name: Build .app with PyInstaller
+      - name: Build, sign and package
         run: |
-          pyinstaller \
-            --noconfirm --windowed \
-            --name "QStrauss Voice" \
-            --icon "resources/QStraussVoice.icns" \
-            --add-data "dictionary.json:." \
-            --add-data "resources:resources" \
-            --add-data "overlay.py:." \
-            --add-data "settings_window.py:." \
-            --hidden-import "faster_whisper" \
-            --hidden-import "ctranslate2" \
-            --hidden-import "tokenizers" \
-            --hidden-import "huggingface_hub" \
-            --hidden-import "sounddevice" \
-            --hidden-import "pynput.keyboard._darwin" \
-            --hidden-import "pynput.mouse._darwin" \
-            --hidden-import "objc" \
-            --hidden-import "AppKit" \
-            --hidden-import "Foundation" \
-            --hidden-import "Quartz" \
-            --hidden-import "WebKit" \
-            --hidden-import "overlay" \
-            --hidden-import "settings_window" \
-            --collect-all "faster_whisper" \
-            --collect-all "ctranslate2" \
-            --collect-all "pyobjc-framework-Cocoa" \
-            --collect-all "pyobjc-framework-WebKit" \
-            --collect-all "pyobjc-framework-Quartz" \
-            voice_typer.py
-
-      - name: Configure Info.plist
-        run: |
-          PLIST="dist/QStrauss Voice.app/Contents/Info.plist"
-          /usr/libexec/PlistBuddy -c "Add :NSMicrophoneUsageDescription string 'QStrauss Voice needs microphone access to transcribe your voice.'" "$PLIST" 2>/dev/null || true
-          /usr/libexec/PlistBuddy -c "Add :LSUIElement bool true" "$PLIST" 2>/dev/null || true
-          /usr/libexec/PlistBuddy -c "Set :CFBundleIdentifier com.qstrauss.voice" "$PLIST"
-          /usr/libexec/PlistBuddy -c "Add :CFBundleDisplayName string 'QStrauss Voice'" "$PLIST" 2>/dev/null || true
-
-      - name: Codesign with entitlements
-        run: |
-          codesign --deep --force --sign - \
-            --entitlements entitlements.plist \
-            "dist/QStrauss Voice.app"
-
-      - name: Package
-        run: cd dist && zip -r ../QStrauss-Voice-mac.zip "QStrauss Voice.app"
+          ./build_mac.sh
+        env:
+          CI: "true"
 
       - uses: actions/upload-artifact@v4
         with:
@@ -105,29 +63,11 @@ jobs:
           print('ICO created')
           "
 
-      - name: Build .exe with PyInstaller
+      - name: Build and package
         run: |
-          pyinstaller `
-            --noconfirm --console `
-            --name "QStrauss Voice" `
-            --icon "resources/QStraussVoice.ico" `
-            --add-data "dictionary.json;." `
-            --add-data "resources;resources" `
-            --add-data "settings_window_win.py;." `
-            --hidden-import "faster_whisper" `
-            --hidden-import "ctranslate2" `
-            --hidden-import "tokenizers" `
-            --hidden-import "huggingface_hub" `
-            --hidden-import "sounddevice" `
-            --hidden-import "pynput.keyboard._win32" `
-            --hidden-import "pynput.mouse._win32" `
-            --hidden-import "pystray._win32" `
-            --collect-all "faster_whisper" `
-            --collect-all "ctranslate2" `
-            voice_typer.py
-
-      - name: Package
-        run: Compress-Archive -Path "dist\QStrauss Voice" -DestinationPath QStrauss-Voice-win.zip
+          .\build_win.bat
+        env:
+          CI: "true"
 
       - uses: actions/upload-artifact@v4
         with:

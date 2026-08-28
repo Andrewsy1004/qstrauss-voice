@@ -6,12 +6,14 @@ echo ===================================
 echo   QStrauss Voice — Windows Build
 echo ===================================
 
-if not exist ".venv" (
+if exist ".venv" (
+    call .venv\Scripts\activate.bat
+) else if not defined CI (
     echo Run setup_win.bat first.
     pause & exit /b 1
+) else (
+    echo Sin .venv, usando el Python del entorno ^(CI^)
 )
-
-call .venv\Scripts\activate.bat
 
 pip install pyinstaller pystray Pillow pywebview -q
 
@@ -56,4 +58,12 @@ echo.
 echo   Distribute the entire dist\ folder
 echo   (the .exe needs its sibling files)
 echo ===================================
+
+if defined CI (
+    echo Empaquetando...
+    if exist QStrauss-Voice-win.zip del QStrauss-Voice-win.zip
+    powershell -Command "Compress-Archive -Path 'dist\QStrauss Voice' -DestinationPath QStrauss-Voice-win.zip"
+    exit /b 0
+)
+
 pause

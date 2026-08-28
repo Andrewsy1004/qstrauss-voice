@@ -10,12 +10,16 @@ echo "==================================="
 echo "  QStrauss Voice — Mac Build"
 echo "==================================="
 
-# Activate venv
-if [ ! -d ".venv" ]; then
+# El venv es para uso local. En CI las dependencias ya estan instaladas en el
+# entorno de Python, asi que se usa el que haya en vez de fallar.
+if [ -d ".venv" ]; then
+    source .venv/bin/activate
+elif [ -z "$CI" ]; then
     echo "Run ./setup_mac.sh first."
     exit 1
+else
+    echo "Sin .venv, usando el Python del entorno (CI)"
 fi
-source .venv/bin/activate
 
 # Install build tool
 pip install pyinstaller Pillow -q
@@ -101,6 +105,16 @@ echo "Signing app with entitlements..."
 codesign --deep --force --sign - \
   --entitlements "$SCRIPT_DIR/entitlements.plist" \
   "dist/QStrauss Voice.app"
+
+# Empaquetado. ditto es la herramienta de Apple para bundles firmados:
+# conserva metadatos y firma, y comprime mucho mejor que zip (medido: 222 MB
+# contra 725 MB del mismo .app).
+if [ -n "$CI" ] || [ "$1" = "--zip" ]; then
+    echo "Empaquetando..."
+    rm -f QStrauss-Voice-mac.zip
+    ditto -c -k --sequesterRsrc --keepParent "dist/QStrauss Voice.app" QStrauss-Voice-mac.zip
+    echo "  QStrauss-Voice-mac.zip ($(du -h QStrauss-Voice-mac.zip | cut -f1))"
+fi
 
 echo ""
 echo "==================================="
